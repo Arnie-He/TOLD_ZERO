@@ -3,6 +3,7 @@ from flax import struct
 import jax
 from jaxtyping import PRNGKeyArray
 import optax
+import flax.linen as nn
 
 from tdmpc2_jax.world_model import WorldModel
 import jax.numpy as jnp
@@ -11,6 +12,7 @@ import numpy as np
 from typing import Any, Dict, Tuple
 from tdmpc2_jax.common.scale import percentile_normalization
 from tdmpc2_jax.common.util import sg
+from mcts import TreeNode, MinMax, support_to_scalar
 
 
 class TDMPC2(struct.PyTreeNode):
@@ -19,6 +21,7 @@ class TDMPC2(struct.PyTreeNode):
 
   # Planning
   mpc: bool
+  mcts: bool
   horizon: int = struct.field(pytree_node=False)
   mppi_iterations: int = struct.field(pytree_node=False)
   population_size: int = struct.field(pytree_node=False)
@@ -44,6 +47,7 @@ class TDMPC2(struct.PyTreeNode):
              world_model: WorldModel,
              # Planning
              mpc: bool,
+             mcts: bool,
              horizon: int,
              mppi_iterations: int,
              population_size: int,
@@ -65,6 +69,7 @@ class TDMPC2(struct.PyTreeNode):
 
     return cls(model=world_model,
                mpc=mpc,
+               mcts=mcts,
                horizon=horizon,
                mppi_iterations=mppi_iterations,
                population_size=population_size,
@@ -87,25 +92,122 @@ class TDMPC2(struct.PyTreeNode):
 
   def act(self,
           obs: np.ndarray,
+          minmax: MinMax,
           prev_plan: jax.Array = None,
           train: bool = True,
           *,
           key: PRNGKeyArray):
     z = self.model.encode(obs, self.model.encoder.params)
     z = jnp.atleast_2d(z)
-
     if self.mpc:
       action, plan = self.plan(z, prev_plan=prev_plan, train=train, key=key)
+    elif self.mcts:
+      action, plan = self.search(z, self.model, minmax, prev_plan=prev_plan, key=key)
     else:
       action = self.model.sample_actions(
           z, self.model.policy_model.params, key=key)[0].squeeze()
       plan = None
-
     return np.array(action), plan
+  
+  def search(self,
+             z: jax.Array,
+             model: WorldModel,
+             minmax: MinMax,
+             prev_plan: Tuple[jax.Array, jax.Array] = None,
+             *,
+             key: PRNGKeyArray) -> Tuple[jax.Array, jax.Array]:
+    init_latent = z
+    key, policy_key, value_key = jax.random.split(key, 3)
+    init_policy, init_policy_prob, _  = model.sample_actions(
+        init_latent, model.policy_model.params, key=policy_key)
+     # init has shape (1, 2), init_policy_prob has shape (1, 2)
+    init_value, _ = self.model.Q(init_latent, init_policy, self.model.value_model.params, key=value_key)
+    init_value = jnp.mean(init_value, axis=0)
+    # init_value = self.estimate_value(init_latent, init_policy, key=value_key)
+    # init_value shape: (1,)
+    # This is the parameter for Cartpole, need to change for Atari
+    root_dirichlet_alpha = 0.25
+    explore_frac = 0.25
+    init_policy_prob = self.add_dirichlet(
+        init_policy_prob, root_dirichlet_alpha, explore_frac)
+    # init_policy_prob has shape (1, 2)
+    init_lstm_hiddens = None
+    root_node = TreeNode(
+            latent=init_latent,
+            action_size=model.action_dim,
+            val_pred=init_value,
+            pol_pred=init_policy_prob,
+            num_visits=0,
+            minmax=minmax,
+            lstm_hiddens=init_lstm_hiddens,
+        )
+    for _ in range(40):
+        # 40 is num_simulations
+        current_node = root_node
+        new_node = False
+        
+        # search list tracks the route of the simulation through the tree
+        search_list = []
+        while not new_node:
+            search_list.append(current_node)
+            value_pred = current_node.val_pred
+            policy_pred = current_node.pol_pred
+            latent = current_node.latent
+            action_n = current_node.pick_action()
+
+            if current_node.children[action_n] is None:
+                # one-hot encoding the action
+                action = jnp.eye(model.action_dim)[action_n]
+                action = jnp.expand_dims(action, 0)
+                latent = self.model.next(
+                    latent, action, self.model.dynamics_model.params)
+                reward, _ = self.model.reward(
+                    z, action, self.model.reward_model.params)
+                key, policy_key, value_key = jax.random.split(key, 3)
+                new_policy, new_policy_prob, _  = model.sample_actions(
+                    latent, model.policy_model.params, key=policy_key)
+                new_value , _ = self.model.Q(latent, new_policy, self.model.value_model.params, key=value_key)
+                new_value = jnp.mean(new_value, axis=0)
+                # TODO: Do I need this?
+                # reward = support_to_scalar(nn.softmax(reward, 0))
+                # new_value = support_to_scalar(nn.softmax(new_value, 0))
+                current_node.insert(
+                        action_n=action_n,
+                        latent=latent,
+                        val_pred=new_value,
+                        pol_pred=new_policy_prob,
+                        reward=reward,
+                        minmax=minmax,
+                    )
+                new_node = True
+            else:
+                # If we have already explored this node then we take the child as our new current node
+                current_node = current_node.children[action_n]
+        
+        discount = 0.997
+        self.backpropagate(search_list, new_value, minmax, discount)
+    
+    temperature = 0
+    return sg(root_node.pick_game_action(temperature)), ()
+  
+  def backpropagate(self, search_list, value, minmax, discount):
+    """Going backward through the visited nodes, we increase the visit count of each by one
+    and set the value, discounting the value at the node ahead, but then adding the reward"""
+    for node in search_list[::-1]:
+        node.num_visits += 1
+        value = node.reward + (value * discount)
+        node.update_val(value)
+        minmax.update(value)
+  
+  def add_dirichlet(self, prior, dirichlet_alpha, explore_frac):
+    noise = np.random.dirichlet([dirichlet_alpha] * len(prior))
+    new_prior = (1 - explore_frac) * prior + explore_frac * noise
+    return new_prior
+
 
   @jax.jit
   def plan(self,
-           z: jax.Array,
+           z: jax.Array, # shape: (1, latent_dim: 512)
            prev_plan: Tuple[jax.Array, jax.Array] = None,
            train: bool = False,
            *,
@@ -138,6 +240,7 @@ class TDMPC2(struct.PyTreeNode):
     for t in range(self.horizon-1):
       policy_actions = policy_actions.at[t].set(
           self.model.sample_actions(_z, self.model.policy_model.params, key=prior_keys[t])[0])
+      print(policy_actions.shape)
       _z = self.model.next(
           _z, policy_actions[t], self.model.dynamics_model.params)
     policy_actions = policy_actions.at[-1].set(
@@ -325,9 +428,9 @@ class TDMPC2(struct.PyTreeNode):
 
     # Update policy
     def policy_loss_fn(params: Dict):
-      actions, _, _, log_probs = self.model.sample_actions(
+      actions, pi, log_probs = self.model.sample_actions(
           zs, params, key=policy_key)
-
+      print(f'Actions: {actions.shape}, pi: {pi.shape}, log_probs: {log_probs.shape}')
       # Compute Q-values
       Qs, _ = self.model.Q(
           zs, actions, new_value_model.params, value_dropout_key2)
@@ -338,8 +441,11 @@ class TDMPC2(struct.PyTreeNode):
 
       # Compute policy objective (equation 4)
       rho = self.rho ** jnp.arange(self.horizon+1)
-      policy_loss = ((self.entropy_coef * log_probs -
+      entropy = jnp.sum(pi * log_probs, axis=-1)
+      print(f'pi * log_probs: {(pi * log_probs).shape}')
+      policy_loss = ((self.entropy_coef * entropy -
                      Q).mean(axis=1) * rho).mean()
+      print(f'Q: {Q.shape}, entropy: {entropy.shape}')
       return policy_loss, {'policy_loss': policy_loss, 'policy_scale': scale}
     policy_grads, policy_info = jax.grad(policy_loss_fn, has_aux=True)(
         self.model.policy_model.params)
@@ -390,8 +496,8 @@ class TDMPC2(struct.PyTreeNode):
   def td_target(self, next_z: jax.Array, reward: jax.Array, terminal: jax.Array,
                 key: PRNGKeyArray) -> jax.Array:
     action_key, ensemble_key, dropout_key = jax.random.split(key, 3)
-    next_action = self.model.sample_actions(
-        next_z, self.model.policy_model.params, key=action_key)[0]
+    next_action, next_pi, next_log_pi = self.model.sample_actions(
+        next_z, self.model.policy_model.params, key=action_key)
 
     # Sample two Q-values from the target ensemble
     all_inds = jnp.arange(0, self.model.num_value_nets)
@@ -400,4 +506,6 @@ class TDMPC2(struct.PyTreeNode):
     Qs, _ = self.model.Q(
         next_z, next_action, self.model.target_value_model.params, key=dropout_key)
     Q = jnp.min(Qs[inds], axis=0)
+    entropy = jnp.sum(next_pi * next_log_pi, axis=-1)
+    print(f'next_Q: {Q.shape}')
     return sg(reward + (1 - terminal) * self.discount * Q)

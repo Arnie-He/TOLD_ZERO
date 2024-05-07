@@ -10,10 +10,14 @@ from tdmpc2_jax import WorldModel, TDMPC2
 from tdmpc2_jax.data import EpisodicReplayBuffer
 import os
 import hydra
-from tdmpc2_jax.wrappers.action_scale import RescaleActions
+from tdmpc2_jax.wrappers.action_scale import RescaleActions, OneHotAction, FourierFeatures
 import jax.numpy as jnp
+import math
+from mcts import MinMax
 
 os.environ['PYDEVD_DISABLE_FILE_VALIDATION'] = '1'
+CARTPOLE_MIN_VALS = np.array([-2.4, -5., -math.pi/12., -math.pi*2.])
+CARTPOLE_MAX_VALS = np.array([2.4, 5., math.pi/12., math.pi*2.])
 
 
 @hydra.main(config_name='config', config_path='.')
@@ -25,11 +29,16 @@ def train(cfg: dict):
   tdmpc_config = cfg['tdmpc2']
 
   T = 500
-  seed_steps = max(5*T, 1000)
-  env = gym.make("HalfCheetah-v4")
-  env = RescaleActions(env)
+  seed_steps = 0
+  # HalfCheetah-v4
+  env = gym.make("CartPole-v1")
+  # check if the environment has a discrete action space
+  if not isinstance(env.action_space, gym.spaces.Discrete):
+    env = RescaleActions(env)
   # env = RepeatAction(env, repeat=2)
   env = gym.wrappers.RecordEpisodeStatistics(env)
+  # env = FourierFeatures(env, CARTPOLE_MIN_VALS, CARTPOLE_MAX_VALS)
+  env = OneHotAction(env)
   env.action_space.seed(seed)
   env.observation_space.seed(seed)
   np.random.seed(seed)
@@ -38,6 +47,13 @@ def train(cfg: dict):
   dtype = jnp.dtype(model_config['dtype'])
   rng, model_key = jax.random.split(rng, 2)
   encoder = nn.Sequential(
+      # [
+      #   nn.Conv2D(16, (8, 8), (4, 4), 'SAME'),
+      #   nn.relu,
+      #   nn.Conv2D(32, (4, 4), (2, 2), 'SAME'),
+      #   nn.relu,
+      #   nn.Flatten(),
+      # ] + 
       [
           NormedLinear(encoder_config['encoder_dim'],
                        activation=mish, dtype=dtype)
@@ -63,7 +79,7 @@ def train(cfg: dict):
       capacity=max_steps,
       dummy_input=dict(
           observation=env.observation_space.sample(),
-          action=env.action_space.sample(),
+          action=env.action_sample(),
           reward=1.0,
           next_observation=env.observation_space.sample(),
           terminated=True,
@@ -76,14 +92,16 @@ def train(cfg: dict):
   ep_info = {}
   ep_count = 0
   prev_plan = None
+  minmax = MinMax()
   observation, _ = env.reset(seed=seed)
   for i in tqdm.tqdm(range(max_steps), smoothing=0.1):
     if i <= seed_steps:
-      action = env.action_space.sample()
+      action = env.action_sample()
     else:
       rng, action_key = jax.random.split(rng)
       action, prev_plan = agent.act(
-          observation, prev_plan, train=True, key=action_key)
+          observation, minmax, prev_plan, train=True, key=action_key)
+    # print(f"Action: {action}")
 
     next_observation, reward, terminated, truncated, info = env.step(action)
     replay_buffer.insert(dict(
@@ -117,7 +135,9 @@ def train(cfg: dict):
 
       rng, *update_keys = jax.random.split(rng, num_updates+1)
       for j in range(num_updates):
+        # print(f"Update {j}...")
         batch = replay_buffer.sample(agent.batch_size, agent.horizon)
+        # batch['action] should be horizon x batch_size x action_dim, but it is batch_size x horizon
         agent, train_info = agent.update(
             observations=batch['observation'],
             actions=batch['action'],

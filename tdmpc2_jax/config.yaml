@@ -22,7 +22,8 @@ world_model:
 
 tdmpc2:
   # Planning
-  mpc: True
+  mpc: False
+  mcts: True
   horizon: 3
   mppi_iterations: 6
   population_size: 512
@@ -39,5 +40,5 @@ tdmpc2:
   reward_coef: 0.1
   continue_coef: 0.1
   value_coef: 0.1
-  entropy_coef: 1e-4
+  entropy_coef: 1e-3
   tau: 0.01

@@ -10,6 +10,7 @@ from tdmpc2_jax.common.activations import mish, simnorm
 from jaxtyping import PRNGKeyArray
 import jax
 import jax.numpy as jnp
+from jax import random
 import optax
 from tdmpc2_jax.networks import Ensemble
 import gymnasium as gym
@@ -67,7 +68,11 @@ class WorldModel(struct.PyTreeNode):
              ):
     dynamics_key, reward_key, value_key = jax.random.split(key, 3)
 
-    action_dim = np.prod(action_space.shape)
+    if isinstance(action_space, gym.spaces.Discrete):
+        # TODO: revise this for other discrete action spaces
+        action_dim = action_space.n
+    else:
+        action_dim = np.prod(action_space.shape)
 
     encoder = TrainState.create(
         apply_fn=encoder_module.apply,
@@ -113,8 +118,9 @@ class WorldModel(struct.PyTreeNode):
     policy_module = nn.Sequential([
         NormedLinear(mlp_dim, activation=mish, dtype=dtype),
         NormedLinear(mlp_dim, activation=mish, dtype=dtype),
-        nn.Dense(2*action_dim,
-                 kernel_init=nn.initializers.truncated_normal(0.02))
+        nn.Dense(action_dim,
+                 kernel_init=nn.initializers.truncated_normal(0.02)),
+        nn.softmax
     ])
     policy_model = TrainState.create(
         apply_fn=policy_module.apply,
@@ -249,23 +255,36 @@ class WorldModel(struct.PyTreeNode):
                      key: PRNGKeyArray
                      ) -> Tuple[jax.Array, ...]:
     # Chunk the policy model output to get mean and logstd
-    mu, log_std = jnp.split(self.policy_model.apply_fn(
-        {'params': params}, z), 2, axis=-1)
-    log_std = min_log_std + 0.5 * \
-        (max_log_std - min_log_std) * (jnp.tanh(log_std) + 1)
+    # mu, log_std = jnp.split(self.policy_model.apply_fn(
+    #     {'params': params}, z), 2, axis=-1)
+    # log_std = min_log_std + 0.5 * \
+    #     (max_log_std - min_log_std) * (jnp.tanh(log_std) + 1)
 
-    # Sample action and compute logprobs
-    eps = jax.random.normal(key, mu.shape)
-    x_t = mu + eps * jnp.exp(log_std)
-    residual = (-0.5 * eps**2 - log_std).sum(-1)
-    log_probs = x_t.shape[-1] * (residual - 0.5 * jnp.log(2 * jnp.pi))
+    # # Sample action and compute logprobs
+    # eps = jax.random.normal(key, mu.shape)
+    # x_t = mu + eps * jnp.exp(log_std)
+    # residual = (-0.5 * eps**2 - log_std).sum(-1)
+    # log_probs = x_t.shape[-1] * (residual - 0.5 * jnp.log(2 * jnp.pi))
 
-    # Squash tanh
-    mean = jnp.tanh(mu)
-    action = jnp.tanh(x_t)
-    log_probs -= jnp.log((1 - action**2) + 1e-6).sum(-1)
+    # # Squash tanh
+    # mean = jnp.tanh(mu)
+    # action = jnp.tanh(x_t)
+    # log_probs -= jnp.log((1 - action**2) + 1e-6).sum(-1)
+    pi = self.policy_model.apply_fn(
+        {'params': params}, z)
+    # pi has shape horizon x action_dim or horizon x batch x action_dim
+    key, subkey = random.split(key)
+    action = jax.random.categorical(subkey, pi, axis=-1)
 
-    return action, mean, log_std, log_probs
+    # Convert actions to one-hot encoding
+    action_one_hot = jnp.eye(self.action_dim)[action]
+
+    # Calculate the log probabilities using pi
+    log_probs = jnp.log(pi + 1e-6)  # Adding a small constant to avoid log(0)
+    # Correctly gather the log probabilities of the sampled actions
+    # action_log_probs = jnp.take_along_axis(log_probs, jnp.expand_dims(action, axis=-1), axis=-1).squeeze(axis=-1)
+    # action_one_hot has shape horizon x batch x action_dim, pi has shape horizon x batch x action_dim, log_probs has shape horizon x batch x action_dim
+    return action_one_hot, pi, log_probs
 
   @jax.jit
   def Q(self, z: jax.Array, a: jax.Array, params: Dict, key: PRNGKeyArray
