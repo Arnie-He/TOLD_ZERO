@@ -19,3 +19,24 @@ Install the package from the base directory with
 ```[bash]
 pip install -e .
 ```
+## Training TOLD-ZERO
+
+The step and returns information will be logged into the tdmpc2_jax directory by running the following
+
+```[bash]
+cd tdmpc2_jax
+python train.py
+```
+
+## Visualization
+
+Copy the logged info in the txt to data.csv in visualizations directory, then run the following
+
+```[bash]
+cd ../visualizations
+python viz.py
+```
+
+The visualization will be saved in visualizations/output directory
+
+
