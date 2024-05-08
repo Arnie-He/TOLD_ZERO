@@ -1,0 +1,6 @@
+The shadows around the lines represent the confidence interval or variability in
+the return across multiple runs of the same algorithm.
+They can be calculated as standard deviations from the mean return, or using other 
+statistical methods such as percentiles. 
+Record returns after running each episode. 
+Shadow area may come from bootstrapping confidence interval. 
