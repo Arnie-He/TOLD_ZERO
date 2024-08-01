@@ -1,6 +1,6 @@
-# tdmpc2-jax
+# TOLD-ZERO
 
-A re-implementation of [TD-MPC2](https://www.tdmpc2.com/) in Jax/Flax. JIT'ing the planning/update steps makes training 5-10x faster compared to the original PyTorch implementation.
+The first part is a re-implementation of [TD-MPC2](https://www.tdmpc2.com/) in Jax/Flax. JIT'ing the planning/update steps makes training 5-10x faster compared to the original PyTorch implementation.
 
 ## Usage
 
